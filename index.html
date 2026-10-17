@@ -1,0 +1,170 @@
+<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MiniCraft</title>
+<style>
+html,body{margin:0;height:100%;overflow:hidden;background:#000;font-family:sans-serif}
+canvas#c{display:block;width:100%;height:100%}
+#cross{position:fixed;left:50%;top:50%;width:20px;height:20px;margin:-10px;pointer-events:none}
+#cross:before,#cross:after{content:"";position:absolute;background:#fff;mix-blend-mode:difference}
+#cross:before{left:9px;top:0;width:2px;height:20px}#cross:after{top:9px;left:0;height:2px;width:20px}
+#hud{position:fixed;left:8px;top:8px;color:#fff;font:12px monospace;text-shadow:1px 1px #000}
+#bar{position:fixed;bottom:12px;left:50%;transform:translateX(-50%);display:flex;gap:4px;background:#0006;padding:4px;border:2px solid #333}
+#bar canvas{width:44px;height:44px;border:3px solid #555;image-rendering:pixelated;background:#222}
+#bar canvas.s{border-color:#fff}
+#menu{position:fixed;inset:0;background:#000a;color:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;text-align:center;padding:16px}
+#menu h1{font-size:48px;margin:0;text-shadow:3px 3px #333}
+#menu input,#menu button{font-size:18px;padding:8px 16px}
+#menu p{max-width:480px;font-size:13px;line-height:1.7;opacity:.85}
+</style></head><body>
+<canvas id="c"></canvas><div id="cross"></div><div id="hud"></div><div id="bar"></div>
+<div id="menu"><h1>MiniCraft</h1><input id="name" maxlength="12" placeholder="名前"><button id="play">プレイ</button>
+<p>WASD 移動 / Space ジャンプ / Ctrl ダッシュ / F 飛行切替(Spaceで上昇, Shiftで下降)<br>左クリック 破壊 / 右クリック 設置 / 1〜8 またはホイールでブロック選択 / Esc でメニュー</p></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+const H=64,RD=5,$=id=>document.getElementById(id),cv=$('c');
+let seed=1,ws,myId=0,ready=false,sel=1;
+const edits=new Map(),chunks=new Map(),meshes=new Map(),others=new Map(),keys={};
+function hash(x,z,s){let h=Math.imul(x,374761393)+Math.imul(z,668265263)+Math.imul(s,982451653)|0;h=Math.imul(h^h>>>13,1274126177);return((h^h>>>16)>>>0)/4294967296}
+function vn(x,z,s){const xi=Math.floor(x),zi=Math.floor(z),fx=x-xi,fz=z-zi,u=fx*fx*(3-2*fx),v=fz*fz*(3-2*fz),a=hash(xi,zi,s),b=hash(xi+1,zi,s),c=hash(xi,zi+1,s),d=hash(xi+1,zi+1,s);return a+(b-a)*u+(c-a)*v+(a-b-c+d)*u*v}
+const hgt=(x,z)=>Math.floor(18+vn(x/80,z/80,seed)*16+vn(x/28,z/28,seed+1)*8+vn(x/10,z/10,seed+2)*3);
+
+// ---- テクスチャ(プロシージャル16x16ドット絵) ----
+const AT=document.createElement('canvas');AT.width=128;AT.height=32;const ag=AT.getContext('2d');
+const TC=[[96,160,56,24],[134,96,67,18],[134,96,67,18],[125,125,125,16],[219,207,142,10],[102,81,50,14],[160,130,80,12],[58,125,40,34],[157,129,78,10],[110,110,110,30]];
+for(let t=0;t<10;t++)for(let y=0;y<16;y++)for(let x=0;x<16;x++){
+  let[r,g,b,v]=TC[t],k=0;
+  if(t==1&&(y<3||(y==3&&hash(x,1,9)<.5)))[r,g,b]=TC[0];
+  if(t==5&&x%4==0)k=-22;
+  if(t==6){const d=Math.max(Math.abs(x-7.5),Math.abs(y-7.5));if(d>6.5)[r,g,b]=[102,81,50];else if(Math.floor(d)%2==0)k=-25}
+  if(t==8&&y%4==3)k=-40;
+  if(t==9&&((x+(y>>2)*3)%8==0||y%5==0))k=-45;
+  const n=(hash(x,y,t+20)-.5)*2*v+k;
+  ag.fillStyle=`rgb(${r+n|0},${g+n|0},${b+n|0})`;ag.fillRect(t%8*16+x,(t>>3)*16+y,1,1);
+}
+const tex=new THREE.CanvasTexture(AT);tex.magFilter=tex.minFilter=THREE.NearestFilter;
+const mat=new THREE.MeshBasicMaterial({map:tex,vertexColors:true});
+// ブロック: [上,側面,下]のタイル番号 / 1草 2土 3石 4砂 5原木 6葉 7板材 8丸石
+const BT=[0,[0,1,2],[2,2,2],[3,3,3],[4,4,4],[6,5,6],[7,7,7],[8,8,8],[9,9,9]];
+const bar=$('bar');
+for(let i=1;i<=8;i++){const c=document.createElement('canvas');c.width=c.height=16;const t=BT[i][i==1?0:1];
+  c.getContext('2d').drawImage(AT,t%8*16,(t>>3)*16,16,16,0,0,16,16);c.onclick=()=>pick(i);bar.appendChild(c)}
+function pick(i){sel=i;[...bar.children].forEach((c,j)=>c.className=j+1==i?'s':'')}pick(1);
+
+// ---- ワールド生成 ----
+function genChunk(cx,cz){
+  const d=new Uint8Array(16*H*16);let maxY=0;
+  for(let z=0;z<16;z++)for(let x=0;x<16;x++){const h=hgt(cx*16+x,cz*16+z),sand=h<=22;
+    for(let y=0;y<=h;y++){d[x+z*16+y*256]=y<h-3?3:y<h?(sand?4:2):(sand?4:1)}if(h>maxY)maxY=h}
+  for(let tz=-2;tz<18;tz++)for(let tx=-2;tx<18;tx++){
+    const wx=cx*16+tx,wz=cz*16+tz;if(hash(wx,wz,seed+7)>=.01)continue;
+    const h=hgt(wx,wz);if(h<=22)continue;const th=4+(hash(wx,wz,seed+8)>.5?1:0);
+    const put=(x,y,z,b,o)=>{if(x<0||x>15||z<0||z>15)return;const i=x+z*16+y*256;if(o||!d[i]){d[i]=b;if(y>maxY)maxY=y}};
+    for(let dy=th-2;dy<=th+1;dy++){const r=dy>=th?1:2;
+      for(let dx=-r;dx<=r;dx++)for(let dz=-r;dz<=r;dz++){if(Math.abs(dx)==r&&Math.abs(dz)==r&&(r==2||dy==th+1))continue;put(tx+dx,h+dy,tz+dz,6,0)}}
+    for(let y=1;y<=th;y++)put(tx,h+y,tz,5,1);
+  }
+  for(const[k,b]of edits){const[x,y,z]=k.split(',').map(Number);if(x>>4==cx&&z>>4==cz){d[(x&15)+(z&15)*16+y*256]=b;if(b&&y>maxY)maxY=y}}
+  d.maxY=maxY;return d;
+}
+function chunk(cx,cz){const k=cx+','+cz;let c=chunks.get(k);if(!c){c=genChunk(cx,cz);chunks.set(k,c)}return c}
+function getB(x,y,z){if(y<0)return 3;if(y>=H)return 0;return chunk(x>>4,z>>4)[(x&15)+(z&15)*16+y*256]}
+// 面: [法線, 4頂点(左下,右下,右上,左上), 明るさ]
+const F=[[1,0,0,[[1,0,1],[1,0,0],[1,1,0],[1,1,1]],.8],[-1,0,0,[[0,0,0],[0,0,1],[0,1,1],[0,1,0]],.8],
+[0,1,0,[[0,1,1],[1,1,1],[1,1,0],[0,1,0]],1],[0,-1,0,[[0,0,0],[1,0,0],[1,0,1],[0,0,1]],.5],
+[0,0,1,[[0,0,1],[1,0,1],[1,1,1],[0,1,1]],.65],[0,0,-1,[[1,0,0],[0,0,0],[0,1,0],[1,1,0]],.65]];
+const scene=new THREE.Scene();scene.background=new THREE.Color(0x87ceeb);scene.fog=new THREE.Fog(0x87ceeb,30,RD*16-6);
+function build(cx,cz){
+  const k=cx+','+cz,d=chunk(cx,cz),P=[],U=[],C=[],I=[];
+  for(let y=0;y<=d.maxY;y++)for(let z=0;z<16;z++)for(let x=0;x<16;x++){
+    const b=d[x+z*16+y*256];if(!b)continue;const wx=cx*16+x,wz=cz*16+z;
+    for(let f=0;f<6;f++){const[dx,dy,dz,q,s]=F[f];if(getB(wx+dx,y+dy,wz+dz))continue;
+      const bt=BT[b],t=f==2?bt[0]:f==3?bt[2]:bt[1],u=(t&7)/8,v=1-((t>>3)+1)/2,n=P.length/3;
+      for(let i=0;i<4;i++){P.push(wx+q[i][0],y+q[i][1],wz+q[i][2]);U.push(u+(i==1||i==2?.125:0),v+(i>1?.5:0));C.push(s,s,s)}
+      I.push(n,n+1,n+2,n,n+2,n+3)}}
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position',new THREE.Float32BufferAttribute(P,3));g.setAttribute('uv',new THREE.Float32BufferAttribute(U,2));
+  g.setAttribute('color',new THREE.Float32BufferAttribute(C,3));g.setIndex(I);
+  const old=meshes.get(k);if(old){scene.remove(old);old.geometry.dispose()}
+  const m=new THREE.Mesh(g,mat);scene.add(m);meshes.set(k,m);
+}
+function setB(x,y,z,b,sendIt){
+  if(y<0||y>=H)return;const cx=x>>4,cz=z>>4,c=chunk(cx,cz);c[(x&15)+(z&15)*16+y*256]=b;if(b&&y>c.maxY)c.maxY=y;
+  edits.set(x+','+y+','+z,b);const s=new Set([cx+','+cz]);
+  if((x&15)==0)s.add(cx-1+','+cz);if((x&15)==15)s.add(cx+1+','+cz);if((z&15)==0)s.add(cx+','+(cz-1));if((z&15)==15)s.add(cx+','+(cz+1));
+  s.forEach(k=>{if(meshes.has(k)){const[a,e]=k.split(',').map(Number);build(a,e)}});
+  if(sendIt)send({t:'set',x,y,z,b});
+}
+function stream(){
+  const pcx=Math.floor(pos.x/16),pcz=Math.floor(pos.z/16),L=[];
+  for(let dx=-RD;dx<=RD;dx++)for(let dz=-RD;dz<=RD;dz++){const dd=dx*dx+dz*dz;if(dd<=RD*RD&&!meshes.has(pcx+dx+','+(pcz+dz)))L.push([dd,pcx+dx,pcz+dz])}
+  L.sort((a,b)=>a[0]-b[0]);for(const[,a,b]of L.slice(0,2))build(a,b);
+  for(const[k,m]of meshes){const[a,b]=k.split(',').map(Number);if(Math.abs(a-pcx)>RD+2||Math.abs(b-pcz)>RD+2){scene.remove(m);m.geometry.dispose();meshes.delete(k)}}
+}
+
+// ---- プレイヤー ----
+const renderer=new THREE.WebGLRenderer({canvas:cv}),cam=new THREE.PerspectiveCamera(75,1,.1,200);cam.rotation.order='YXZ';
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+function resize(){renderer.setSize(innerWidth,innerHeight,false);cam.aspect=innerWidth/innerHeight;cam.updateProjectionMatrix()}addEventListener('resize',resize);resize();
+const pos=new THREE.Vector3(8.5,50,8.5),vel=new THREE.Vector3();let yaw=0,pitch=0,fly=false,onG=false;
+const hit=(px,py,pz)=>{for(let x=Math.floor(px-.3);x<=Math.floor(px+.3);x++)for(let y=Math.floor(py);y<=Math.floor(py+1.79);y++)for(let z=Math.floor(pz-.3);z<=Math.floor(pz+.3);z++)if(getB(x,y,z))return true;return false};
+function move(dt){
+  const sp=(keys.ControlLeft?7:4.3)*(fly?2.5:1);let f=(keys.KeyW?1:0)-(keys.KeyS?1:0),r=(keys.KeyD?1:0)-(keys.KeyA?1:0);const l=Math.hypot(f,r)||1;f/=l;r/=l;
+  vel.x=(-Math.sin(yaw)*f+Math.cos(yaw)*r)*sp;vel.z=(-Math.cos(yaw)*f-Math.sin(yaw)*r)*sp;
+  if(fly)vel.y=((keys.Space?1:0)-(keys.ShiftLeft?1:0))*sp;else{vel.y=Math.max(vel.y-28*dt,-30);if(keys.Space&&onG)vel.y=8.5}
+  for(const a of['x','y','z']){const o=pos[a];if(a=='y')onG=false;pos[a]+=vel[a]*dt;
+    if(hit(pos.x,pos.y,pos.z)){pos[a]=o;if(a=='y'&&vel.y<0)onG=true;vel[a]=0}}
+  if(pos.y<-30){pos.set(8.5,hgt(8,8)+3,8.5);vel.set(0,0,0)}
+}
+function ray(){
+  const o=cam.position,v=new THREE.Vector3();cam.getWorldDirection(v);let x=Math.floor(o.x),y=Math.floor(o.y),z=Math.floor(o.z);
+  const sx=v.x>0?1:-1,sy=v.y>0?1:-1,sz=v.z>0?1:-1,dx=v.x?Math.abs(1/v.x):1e9,dy=v.y?Math.abs(1/v.y):1e9,dz=v.z?Math.abs(1/v.z):1e9;
+  let tx=(v.x>0?x+1-o.x:o.x-x)*dx,ty=(v.y>0?y+1-o.y:o.y-y)*dy,tz=(v.z>0?z+1-o.z:o.z-z)*dz;
+  for(;;){const px=x,py=y,pz=z;let t;
+    if(tx<ty&&tx<tz){t=tx;x+=sx;tx+=dx}else if(ty<tz){t=ty;y+=sy;ty+=dy}else{t=tz;z+=sz;tz+=dz}
+    if(t>6)return null;if(getB(x,y,z))return{x,y,z,px,py,pz}}
+}
+const sel3=new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(1.004,1.004,1.004)),new THREE.LineBasicMaterial({color:0}));scene.add(sel3);
+
+// ---- 入力 ----
+const locked=()=>document.pointerLockElement==cv;
+addEventListener('mousemove',e=>{if(!locked())return;yaw-=e.movementX*.0022;pitch=Math.max(-1.55,Math.min(1.55,pitch-e.movementY*.0022))});
+addEventListener('keydown',e=>{keys[e.code]=true;if(e.code=='KeyF'&&locked())fly=!fly;const m=/^Digit([1-8])$/.exec(e.code);if(m)pick(+m[1])});
+addEventListener('keyup',e=>keys[e.code]=false);
+addEventListener('wheel',e=>pick((sel-1+(e.deltaY>0?1:7))%8+1));
+addEventListener('contextmenu',e=>e.preventDefault());
+addEventListener('mousedown',e=>{if(!locked()||!ready)return;const h=ray();if(!h)return;
+  if(e.button==0)setB(h.x,h.y,h.z,0,1);
+  else if(e.button==2){const{px:x,py:y,pz:z}=h;
+    if(x+1>pos.x-.3&&x<pos.x+.3&&y+1>pos.y&&y<pos.y+1.8&&z+1>pos.z-.3&&z<pos.z+.3)return;setB(x,y,z,sel,1)}});
+document.addEventListener('pointerlockchange',()=>$('menu').style.display=locked()?'none':'flex');
+$('play').onclick=()=>{if(!ws)connect();cv.requestPointerLock()};
+
+// ---- マルチプレイ ----
+const send=o=>ws&&ws.readyState==1&&ws.send(JSON.stringify(o));
+function label(t){const c=document.createElement('canvas');c.width=256;c.height=64;const g=c.getContext('2d');g.fillStyle='#0008';g.fillRect(0,0,256,64);g.fillStyle='#fff';g.font='36px sans-serif';g.textAlign='center';g.fillText(t,128,46);
+  const s=new THREE.Sprite(new THREE.SpriteMaterial({map:new THREE.CanvasTexture(c),depthTest:false}));s.scale.set(1.6,.4,1);s.position.y=2.3;return s}
+function addP(p){if(others.has(p.id))return;const g=new THREE.Group(),col=new THREE.Color().setHSL(hash(p.id,1,3),.6,.5);
+  const bx=(w,h,d,c,y)=>{const m=new THREE.Mesh(new THREE.BoxGeometry(w,h,d),new THREE.MeshBasicMaterial({color:c}));m.position.y=y;g.add(m)};
+  bx(.5,.7,.25,0x3b4a9c,.35);bx(.5,.75,.25,col,1.075);bx(.5,.5,.5,0xe0b48c,1.7);g.add(label(p.name));scene.add(g);
+  g.position.set(p.x,p.y,p.z);others.set(p.id,{g,t:{x:p.x,y:p.y,z:p.z,ry:p.ry||0}})}
+function connect(){
+  ws=new WebSocket((location.protocol=='https:'?'wss://':'ws://')+location.host);
+  ws.onmessage=e=>{const m=JSON.parse(e.data);
+    if(m.t=='init'){myId=m.id;seed=m.seed;m.edits.forEach(a=>edits.set(a[0]+','+a[1]+','+a[2],a[3]));
+      pos.set(8.5,hgt(8,8)+3,8.5);ready=true;send({t:'hello',name:$('name').value||'Player'+myId});m.players.forEach(addP)}
+    else if(m.t=='join')addP(m);
+    else if(m.t=='pos'){const o=others.get(m.id);if(o)o.t={x:m.x,y:m.y,z:m.z,ry:m.ry}}
+    else if(m.t=='set')setB(m.x,m.y,m.z,m.b,0);
+    else if(m.t=='leave'){const o=others.get(m.id);if(o){scene.remove(o.g);others.delete(m.id)}}};
+  ws.onclose=()=>{ready=false;$('hud').textContent='切断されました。リロードしてください'};
+}
+setInterval(()=>{if(ready)send({t:'pos',x:+pos.x.toFixed(2),y:+pos.y.toFixed(2),z:+pos.z.toFixed(2),ry:+yaw.toFixed(2)})},50);
+
+// ---- ループ ----
+let last=performance.now(),fps=0;
+(function loop(now){requestAnimationFrame(loop);const dt=Math.min((now-last)/1000,.033);last=now;fps=fps*.95+.05/(dt||1)*1;
+  if(ready){if(locked())move(dt);stream();
+    cam.position.set(pos.x,pos.y+1.62,pos.z);cam.rotation.set(pitch,yaw,0);
+    const h=ray();sel3.visible=!!h;if(h)sel3.position.set(h.x+.5,h.y+.5,h.z+.5);
+    for(const o of others.values()){const k=Math.min(1,dt*12);o.g.position.x+=(o.t.x-o.g.position.x)*k;o.g.position.y+=(o.t.y-o.g.position.y)*k;o.g.position.z+=(o.t.z-o.g.position.z)*k;o.g.rotation.y=o.t.ry}
+    $('hud').textContent=`XYZ ${pos.x.toFixed(1)} ${pos.y.toFixed(1)} ${pos.z.toFixed(1)} | オンライン ${others.size+1}人${fly?' | 飛行中':''}`}
+  renderer.render(scene,cam)})(last);
+</script></body></html>
